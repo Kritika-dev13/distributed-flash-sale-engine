@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # dns_sd resolves *every* replica behind the service name, so
+  # `docker compose up --scale api=3 --scale worker=4` is picked up automatically.
+  - job_name: api
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ['api']
+        type: A
+        port: 3000
+        refresh_interval: 10s
+
+  - job_name: worker
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ['worker']
+        type: A
+        port: 9101
+        refresh_interval: 10s

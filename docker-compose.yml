@@ -1,0 +1,135 @@
+name: flash-sale
+
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+  REDIS_URL: redis://redis:6379
+  RABBITMQ_URL: amqp://flash:flash@rabbitmq:5672
+  DATABASE_URL: postgres://flash:flash@postgres:5432/flashsale
+  PER_USER_PURCHASE_LIMIT: "2"
+  RL_GLOBAL_CAPACITY: "6000"
+  RL_GLOBAL_REFILL_PER_SEC: "4000"
+  WORKER_PREFETCH: "50"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: flash
+      POSTGRES_PASSWORD: flash
+      POSTGRES_DB: flashsale
+    command: ["postgres", "-c", "max_connections=200"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flash -d flashsale"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # AOF every second bounds stock loss on crash to ~1s; noeviction guarantees keys are never silently dropped.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    volumes: ["redisdata:/data"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: flash
+      RABBITMQ_DEFAULT_PASS: flash
+    volumes: ["rabbitdata:/var/lib/rabbitmq"]
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  # One-shot job: copies available stock from PostgreSQL into Redis (SET NX, so it never clobbers live stock).
+  prewarm:
+    build: .
+    image: flash-sale-engine:local
+    command: ["node", "dist/scripts/prewarm.js"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: .
+    image: flash-sale-engine:local
+    command: ["node", "dist/api/server.js"]
+    environment:
+      <<: *app-env
+      PORT: "3000"
+    ports: ["3000:3000"]   # drop this line (and put a load balancer in front) to use `--scale api=N`
+    depends_on:
+      prewarm: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: flash-sale-engine:local
+    command: ["node", "dist/workers/main.js"]
+    environment:
+      <<: *app-env
+      WORKER_METRICS_PORT: "9101"
+    deploy:
+      replicas: 2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    restart: unless-stopped   # worker exits if its AMQP connection drops; Docker brings it back
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [api, worker]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports: ["3001:3000"]
+    depends_on: [prometheus]
+
+  # Optional: docker compose --profile loadtest up locust   ->  http://localhost:8089
+  locust:
+    image: locustio/locust:2.32.0
+    profiles: ["loadtest"]
+    volumes: ["./loadtest:/mnt/locust:ro"]
+    command: ["-f", "/mnt/locust/locustfile.py", "--host", "http://api:3000", "--processes", "-1"]
+    ports: ["8089:8089"]
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitdata:
+  grafanadata:
